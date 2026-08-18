@@ -424,3 +424,539 @@ def process_validation_metrics(data_sources: list[str], sample_inputs: list[str]
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(prompt_vals)
 
     return data_src2var2metric2val
+
+@torch.no_grad()
+def compute_gopd_diagnostics(
+    student_log_prob: torch.Tensor,
+    teacher_log_prob: torch.Tensor,
+    gopd_ref_log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    lambda_val: float,
+    eps: float = 1e-8,
+) -> Dict[str, float]:
+    """Compute token-level diagnostics for G-OPD.
+
+    Definitions:
+        A_opd   = log pi_teacher - log pi_student
+        A_extra = log pi_teacher - log pi_ref
+        C_extra = (lambda - 1) * A_extra
+        A_gopd  = A_opd + C_extra
+
+    All statistics are computed over valid response tokens only.
+
+    Position-wise statistics use relative positions within each response:
+        [0%, 20%), [20%, 40%), [40%, 60%),
+        [60%, 80%), [80%, 100%].
+
+    "Extreme" tokens are defined as the top 1% valid response tokens
+    ranked by |C_extra| within the current training batch.
+    """
+
+    mask = response_mask.bool()
+
+    # =========================================================
+    # 1. Construct token-level signals
+    # =========================================================
+    opd_adv = teacher_log_prob - student_log_prob
+
+    extra_adv = teacher_log_prob - gopd_ref_log_prob
+
+    extra_term = (
+        float(lambda_val) - 1.0
+    ) * extra_adv
+
+    gopd_adv = opd_adv + extra_term
+
+    # Select valid response tokens and flatten across the batch.
+    opd = opd_adv[mask].float()
+    extra = extra_adv[mask].float()
+    correction = extra_term[mask].float()
+    gopd = gopd_adv[mask].float()
+
+    if opd.numel() == 0:
+        return {}
+
+    opd_abs = opd.abs()
+    extra_abs = extra.abs()
+    correction_abs = correction.abs()
+
+    metrics = {}
+
+    metrics.update(
+        {
+            "gopd/adv_mean":
+                gopd.mean().item(),
+
+            "gopd/adv_std":
+                gopd.std(unbiased=False).item(),
+
+            "gopd/adv_abs_mean":
+                gopd.abs().mean().item(),
+
+            "gopd/adv_abs_p95":
+                torch.quantile(
+                    gopd.abs(),
+                    0.95,
+                ).item(),
+
+            "gopd/adv_abs_p99":
+                torch.quantile(
+                    gopd.abs(),
+                    0.99,
+                ).item(),
+        }
+    )
+
+    # =========================================================
+    # 2. OPD signal distribution
+    # =========================================================
+    metrics.update(
+        {
+            "gopd/opd_adv_mean":
+                opd.mean().item(),
+
+            "gopd/opd_adv_std":
+                opd.std(unbiased=False).item(),
+
+            "gopd/opd_adv_abs_mean":
+                opd_abs.mean().item(),
+
+            "gopd/opd_adv_abs_p95":
+                torch.quantile(opd_abs, 0.95).item(),
+
+            "gopd/opd_adv_abs_p99":
+                torch.quantile(opd_abs, 0.99).item(),
+        }
+    )
+
+    # =========================================================
+    # 3. Raw extrapolation signal distribution
+    # =========================================================
+    metrics.update(
+        {
+            "gopd/extra_adv_mean":
+                extra.mean().item(),
+
+            "gopd/extra_adv_std":
+                extra.std(unbiased=False).item(),
+
+            "gopd/extra_adv_abs_mean":
+                extra_abs.mean().item(),
+
+            "gopd/extra_adv_abs_p95":
+                torch.quantile(extra_abs, 0.95).item(),
+
+            "gopd/extra_adv_abs_p99":
+                torch.quantile(extra_abs, 0.99).item(),
+        }
+    )
+
+    # =========================================================
+    # 4. Actual extrapolation correction
+    #
+    # C_extra = (lambda - 1) * A_extra
+    #
+    # These metrics answer:
+    # "How aggressive is the extrapolation actually entering
+    #  the G-OPD training signal?"
+    # =========================================================
+    metrics.update(
+        {
+            "gopd/extra_term_abs_mean":
+                correction_abs.mean().item(),
+
+            "gopd/extra_term_abs_p95":
+                torch.quantile(
+                    correction_abs,
+                    0.95,
+                ).item(),
+
+            "gopd/extra_term_abs_p99":
+                torch.quantile(
+                    correction_abs,
+                    0.99,
+                ).item(),
+
+            "gopd/extra_term_abs_max":
+                correction_abs.max().item(),
+        }
+    )
+
+    # =========================================================
+    # 5. Reinforcement / conflict
+    #
+    # > 0:
+    #     extrapolation reinforces OPD
+    #
+    # < 0:
+    #     extrapolation conflicts with OPD
+    # =========================================================
+    interaction = opd * correction
+
+    reinforce_mask = interaction > 0
+    conflict_mask = interaction < 0
+
+    reinforce_ratio = (
+        reinforce_mask.float().mean()
+    )
+
+    conflict_ratio = (
+        conflict_mask.float().mean()
+    )
+
+    # How much of the extrapolation magnitude lies on
+    # tokens that conflict with OPD?
+    conflict_mass_ratio = (
+        correction_abs[conflict_mask].sum()
+        / correction_abs.sum().clamp_min(eps)
+    )
+
+    metrics.update(
+        {
+            "gopd/reinforce_ratio":
+                reinforce_ratio.item(),
+
+            "gopd/conflict_ratio":
+                conflict_ratio.item(),
+
+            "gopd/conflict_mass_ratio":
+                conflict_mass_ratio.item(),
+        }
+    )
+
+    # =========================================================
+    # 6. Sign reversal
+    #
+    # Does the extrapolation correction become strong enough
+    # to reverse the sign of the original OPD advantage?
+    #
+    # A_opd * A_gopd < 0
+    # =========================================================
+    flip_ratio = (
+        (opd * gopd < 0)
+        .float()
+        .mean()
+    )
+
+    metrics["gopd/flip_ratio"] = flip_ratio.item()
+
+    # =========================================================
+    # 7. Relative contribution of extrapolation
+    #
+    # q_t =
+    #     |C_extra|
+    #     -------------------------
+    #     |A_opd| + |C_extra| + eps
+    #
+    # q_t in [0, 1]
+    #
+    # q ~ 0:
+    #     OPD dominates.
+    #
+    # q ~ 0.5:
+    #     OPD and extrapolation have similar magnitude.
+    #
+    # q ~ 1:
+    #     extrapolation dominates.
+    # =========================================================
+    contribution = (
+        correction_abs
+        /
+        (
+            opd_abs
+            + correction_abs
+            + eps
+        )
+    )
+
+    metrics.update(
+        {
+            "gopd/extra_contribution_mean":
+                contribution.mean().item(),
+
+            "gopd/extra_contribution_p50":
+                torch.quantile(
+                    contribution,
+                    0.50,
+                ).item(),
+
+            "gopd/extra_contribution_p95":
+                torch.quantile(
+                    contribution,
+                    0.95,
+                ).item(),
+
+            "gopd/extra_contribution_p99":
+                torch.quantile(
+                    contribution,
+                    0.99,
+                ).item(),
+        }
+    )
+
+    # =========================================================
+    # 8. Relative position within each trajectory
+    #
+    # position = 0:
+    #     first response token
+    #
+    # position = 1:
+    #     last valid response token
+    # =========================================================
+    batch_size, max_response_length = mask.shape
+
+    response_lengths = mask.sum(dim=-1)
+
+    token_positions = torch.arange(
+        max_response_length,
+        device=mask.device,
+        dtype=torch.float32,
+    ).unsqueeze(0).expand(
+        batch_size,
+        -1,
+    )
+
+    # For a response of length L:
+    #
+    #     0, 1, ..., L-1
+    #     --------------
+    #          L-1
+    #
+    # gives positions in [0, 1].
+    #
+    # Length-one responses are safely mapped to position 0.
+    position_denominator = (
+        response_lengths
+        .sub(1)
+        .clamp_min(1)
+        .unsqueeze(-1)
+        .float()
+    )
+
+    relative_position = (
+        token_positions
+        / position_denominator
+    )
+
+    # =========================================================
+    # 9. Locate the most extreme extrapolation tokens
+    #
+    # Use exact top 1% instead of >= p99 threshold, because
+    # ties around the quantile threshold could otherwise select
+    # substantially more than 1% of tokens.
+    # =========================================================
+    extreme_relative_position = None
+
+    if (
+        correction_abs.numel() > 0
+        and correction_abs.max().item() > eps
+    ):
+        num_valid_tokens = correction_abs.numel()
+
+        # ceil(0.01 * N), without importing math.
+        num_extreme_tokens = max(
+            1,
+            (num_valid_tokens + 99) // 100,
+        )
+
+        extreme_indices = torch.topk(
+            correction_abs,
+            k=num_extreme_tokens,
+            largest=True,
+            sorted=False,
+        ).indices
+
+        valid_relative_position = (
+            relative_position[mask]
+        )
+
+        extreme_relative_position = (
+            valid_relative_position[
+                extreme_indices
+            ]
+        )
+
+        metrics[
+            "gopd/extreme_position_mean"
+        ] = (
+            extreme_relative_position
+            .mean()
+            .item()
+        )
+
+    # =========================================================
+    # 10. Position-wise diagnostics
+    # =========================================================
+    position_bins = [
+        ("0_20", 0.0, 0.2),
+        ("20_40", 0.2, 0.4),
+        ("40_60", 0.4, 0.6),
+        ("60_80", 0.6, 0.8),
+        ("80_100", 0.8, 1.0),
+    ]
+
+    for bin_idx, (
+        bin_name,
+        lower,
+        upper,
+    ) in enumerate(position_bins):
+
+        if bin_idx < len(position_bins) - 1:
+            position_mask = (
+                mask
+                & (relative_position >= lower)
+                & (relative_position < upper)
+            )
+        else:
+            # Include the final token at relative position 1.0.
+            position_mask = (
+                mask
+                & (relative_position >= lower)
+                & (relative_position <= upper)
+            )
+
+        if not position_mask.any():
+            continue
+
+        bin_opd = (
+            opd_adv[position_mask]
+            .float()
+        )
+
+        bin_correction = (
+            extra_term[position_mask]
+            .float()
+        )
+
+        bin_gopd = (
+            gopd_adv[position_mask]
+            .float()
+        )
+
+        bin_interaction = (
+            bin_opd * bin_correction
+        )
+
+        bin_correction_abs = (
+            bin_correction.abs()
+        )
+
+        bin_contribution = (
+            bin_correction_abs
+            /
+            (
+                bin_opd.abs()
+                + bin_correction_abs
+                + eps
+            )
+        )
+
+        prefix = (
+            f"gopd/position/{bin_name}"
+        )
+
+        # -----------------------------------------------------
+        # How large is extrapolation in this reasoning stage?
+        # -----------------------------------------------------
+        metrics[
+            f"{prefix}/extra_term_abs_mean"
+        ] = (
+            bin_correction_abs
+            .mean()
+            .item()
+        )
+
+        # This is important for distinguishing:
+        #
+        # "the entire stage has stronger extrapolation"
+        #
+        # from
+        #
+        # "only a few tokens in this stage explode".
+        metrics[
+            f"{prefix}/extra_term_abs_p95"
+        ] = (
+            torch.quantile(
+                bin_correction_abs,
+                0.95,
+            )
+            .item()
+        )
+
+        # -----------------------------------------------------
+        # How important is extrapolation relative to OPD?
+        # -----------------------------------------------------
+        metrics[
+            f"{prefix}/extra_contribution_mean"
+        ] = (
+            bin_contribution
+            .mean()
+            .item()
+        )
+
+        # -----------------------------------------------------
+        # Does extrapolation reinforce or conflict with OPD?
+        # -----------------------------------------------------
+        metrics[
+            f"{prefix}/conflict_ratio"
+        ] = (
+            (bin_interaction < 0)
+            .float()
+            .mean()
+            .item()
+        )
+
+        # -----------------------------------------------------
+        # Does it actually reverse the final training signal?
+        # -----------------------------------------------------
+        metrics[
+            f"{prefix}/flip_ratio"
+        ] = (
+            (bin_opd * bin_gopd < 0)
+            .float()
+            .mean()
+            .item()
+        )
+
+        # -----------------------------------------------------
+        # Among the global top-1% strongest extrapolation
+        # tokens, what fraction occurs in this stage?
+        #
+        # Across the five bins, these shares should sum
+        # approximately to 1.
+        # -----------------------------------------------------
+        if extreme_relative_position is not None:
+
+            if bin_idx < len(position_bins) - 1:
+                extreme_in_bin = (
+                    (
+                        extreme_relative_position
+                        >= lower
+                    )
+                    & (
+                        extreme_relative_position
+                        < upper
+                    )
+                )
+            else:
+                extreme_in_bin = (
+                    (
+                        extreme_relative_position
+                        >= lower
+                    )
+                    & (
+                        extreme_relative_position
+                        <= upper
+                    )
+                )
+
+            metrics[
+                f"{prefix}/extreme_token_share"
+            ] = (
+                extreme_in_bin
+                .float()
+                .mean()
+                .item()
+            )
+
+    return metrics

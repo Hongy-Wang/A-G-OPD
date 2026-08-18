@@ -48,6 +48,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
+    compute_gopd_diagnostics
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -1817,72 +1818,26 @@ class RayPPOTrainer:
                             "gopd_ref_log_prob"
                         ]
 
-                        gopd_advantages = batch.batch["advantages"]
-
-                        teacher_ref_log_ratio = (
-                            teacher_log_prob
-                            - gopd_ref_log_prob
+                        gopd_config = self.config.algorithm.get(
+                            "gopd",
+                            {},
                         )
 
-                        student_ref_log_ratio = (
-                            student_log_prob
-                            - gopd_ref_log_prob
+                        lambda_val = gopd_config.get(
+                            "lam",
+                            1.0,
                         )
 
                         metrics.update(
-                            {
-                                "gopd/adv_mean": (
-                                    gopd_advantages[response_mask]
-                                    .mean()
-                                    .detach()
-                                    .item()
-                                ),
-                                "gopd/adv_abs_mean": (
-                                    gopd_advantages[response_mask]
-                                    .abs()
-                                    .mean()
-                                    .detach()
-                                    .item()
-                                ),
-                                "gopd/student_log_prob_mean": (
-                                    student_log_prob[response_mask]
-                                    .mean()
-                                    .detach()
-                                    .item()
-                                ),
-                                "gopd/teacher_log_prob_mean": (
-                                    teacher_log_prob[response_mask]
-                                    .mean()
-                                    .detach()
-                                    .item()
-                                ),
-                                "gopd/ref_log_prob_mean": (
-                                    gopd_ref_log_prob[response_mask]
-                                    .mean()
-                                    .detach()
-                                    .item()
-                                ),
-                                "gopd/teacher_ref_log_ratio_mean": (
-                                    teacher_ref_log_ratio[response_mask]
-                                    .mean()
-                                    .detach()
-                                    .item()
-                                ),
-                                "gopd/teacher_ref_log_ratio_abs_mean": (
-                                    teacher_ref_log_ratio[response_mask]
-                                    .abs()
-                                    .mean()
-                                    .detach()
-                                    .item()
-                                ),
-                                "gopd/student_ref_log_ratio_mean": (
-                                    student_ref_log_ratio[response_mask]
-                                    .mean()
-                                    .detach()
-                                    .item()
-                                ),
-                            }
+                            compute_gopd_diagnostics(
+                                student_log_prob=student_log_prob,
+                                teacher_log_prob=teacher_log_prob,
+                                gopd_ref_log_prob=gopd_ref_log_prob,
+                                response_mask=response_mask,
+                                lambda_val=lambda_val,
+                            )
                         )
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
