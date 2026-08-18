@@ -919,44 +919,49 @@ def compute_gopd_diagnostics(
         )
 
         # -----------------------------------------------------
-        # Among the global top-1% strongest extrapolation
-        # tokens, what fraction occurs in this stage?
-        #
-        # Across the five bins, these shares should sum
-        # approximately to 1.
+        # Fraction of all valid response tokens in this stage
+        # -----------------------------------------------------
+        position_token_share = (
+            position_mask.float().sum()
+            / mask.float().sum().clamp_min(1.0)
+        )
+
+        metrics[
+            f"{prefix}/position_token_share"
+        ] = position_token_share.item()
+
+
+        # -----------------------------------------------------
+        # Extreme-token concentration and enrichment
         # -----------------------------------------------------
         if extreme_relative_position is not None:
 
             if bin_idx < len(position_bins) - 1:
                 extreme_in_bin = (
-                    (
-                        extreme_relative_position
-                        >= lower
-                    )
-                    & (
-                        extreme_relative_position
-                        < upper
-                    )
+                    (extreme_relative_position >= lower)
+                    & (extreme_relative_position < upper)
                 )
             else:
                 extreme_in_bin = (
-                    (
-                        extreme_relative_position
-                        >= lower
-                    )
-                    & (
-                        extreme_relative_position
-                        <= upper
-                    )
+                    (extreme_relative_position >= lower)
+                    & (extreme_relative_position <= upper)
                 )
 
-            metrics[
-                f"{prefix}/extreme_token_share"
-            ] = (
+            extreme_token_share = (
                 extreme_in_bin
                 .float()
                 .mean()
-                .item()
             )
+
+            metrics[
+                f"{prefix}/extreme_token_share"
+            ] = extreme_token_share.item()
+
+            metrics[
+                f"{prefix}/extreme_enrichment"
+            ] = (
+                extreme_token_share
+                / position_token_share.clamp_min(eps)
+            ).item()
 
     return metrics
