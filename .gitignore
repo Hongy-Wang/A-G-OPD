@@ -1,0 +1,38 @@
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Models
+model/
+models/
+
+# Data
+data/
+
+# Training outputs
+checkpoints/
+swanlog/
+wandb/
+validation_outputs*/
+outputs/
+logs/
+
+# Logs
+*.log
+nohup.out
+
+# Cache
+.cache/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# System
+.DS_Store
+
+# Eval outputs
+eval_outputs/
