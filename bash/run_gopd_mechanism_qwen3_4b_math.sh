@@ -288,7 +288,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
-    actor_rollout_ref.rollout.val_kwargs.n=32 \
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
     \
     reward_model.reward_manager=naive \
     \
