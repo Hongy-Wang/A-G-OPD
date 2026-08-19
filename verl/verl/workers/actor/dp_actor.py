@@ -30,7 +30,7 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.debug import GPUMemoryLogger
-from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
+from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available, get_torch_device
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
@@ -372,6 +372,212 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
+    def _build_gopd_component_advantages(
+        self,
+        data,
+        gopd_lambda: float,
+    ):
+        """Build OPD and extrapolation components of the G-OPD advantage."""
+
+        old_log_prob = data["old_log_probs"]
+
+        if "teacher_log_prob" in data:
+            teacher_log_prob = data["teacher_log_prob"]
+        elif "ref_log_prob" in data:
+            teacher_log_prob = data["ref_log_prob"]
+        else:
+            raise KeyError(
+                "G-OPD gradient diagnostics require either "
+                "'teacher_log_prob' or 'ref_log_prob'."
+            )
+
+        if "gopd_ref_log_prob" not in data:
+            raise KeyError(
+                "G-OPD gradient diagnostics require "
+                "'gopd_ref_log_prob'."
+            )
+
+        gopd_ref_log_prob = data["gopd_ref_log_prob"]
+
+        # Standard OPD component:
+        # A_OPD = log pi_T - log pi_old
+        opd_advantages = (
+            teacher_log_prob
+            - old_log_prob
+        ).detach()
+
+        # G-OPD extrapolation correction:
+        # C_extra = (lambda - 1) * (log pi_T - log pi_R)
+        extra_correction = (
+            (gopd_lambda - 1.0)
+            * (
+                teacher_log_prob
+                - gopd_ref_log_prob
+            )
+        ).detach()
+
+        return opd_advantages, extra_correction
+
+    @torch.no_grad()
+    def _get_grad_norm_without_step(self):
+        """Get the global gradient norm without clipping or optimizer step."""
+
+        if isinstance(self.actor_module, FSDP):
+            grad_norm = self.actor_module.clip_grad_norm_(
+                max_norm=float("inf")
+            )
+
+        elif isinstance(self.actor_module, FSDPModule):
+            grad_norm = fsdp2_clip_grad_norm_(
+                self.actor_module.parameters(),
+                max_norm=float("inf"),
+            )
+
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor_module.parameters(),
+                max_norm=float("inf"),
+            )
+
+        return grad_norm
+
+    def _run_gopd_component_grad_pass(
+        self,
+        micro_batches,
+        *,
+        component: str,
+        temperature: float,
+        loss_agg_mode: str,
+        gopd_lambda: float,
+        multi_turn: bool,
+    ):
+        """Compute the accumulated gradient norm for one G-OPD component.
+
+        This performs an independent forward/backward pass over all micro-batches
+        in the current optimizer mini-batch. It never performs optimizer.step().
+        """
+
+        if component not in ("opd", "extra"):
+            raise ValueError(
+                f"Unsupported G-OPD gradient component: {component}"
+            )
+
+        policy_loss_fn = get_policy_loss_fn("gpg")
+
+        # Diagnostic gradients must start from zero.
+        self.actor_optimizer.zero_grad()
+
+        for data in micro_batches:
+            # -------------------------------------------------
+            # Move the micro-batch to the actor device.
+            # Keep this consistent with the normal training path.
+            # -------------------------------------------------
+            if isinstance(data, DataProto):
+                data = {
+                    **data.batch.to(get_device_id()),
+                    **data.non_tensor_batch,
+                }
+
+            elif isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, torch.Tensor):
+                        data[k] = v.to(get_device_id())
+                    elif k == "multi_modal_inputs" and v is not None:
+                        data[k] = [
+                            {
+                                kk: vv.to(get_device_id())
+                                for kk, vv in item_dict.items()
+                            }
+                            for item_dict in v
+                        ]
+
+            else:
+                data = data.to(get_device_id())
+
+            # -------------------------------------------------
+            # Response mask
+            # -------------------------------------------------
+            responses = data["responses"]
+            response_length = responses.size(1)
+
+            if multi_turn:
+                response_mask = data["loss_mask"][
+                    :, -response_length:
+                ]
+            else:
+                response_mask = data["attention_mask"][
+                    :, -response_length:
+                ]
+
+            old_log_prob = data["old_log_probs"]
+
+            # -------------------------------------------------
+            # Independent actor forward for diagnostics.
+            # No entropy is required.
+            # -------------------------------------------------
+            _, log_prob = self._forward_micro_batch(
+                micro_batch=data,
+                temperature=temperature,
+                calculate_entropy=False,
+            )
+
+            # -------------------------------------------------
+            # A_OPD and C_extra
+            # -------------------------------------------------
+            (
+                opd_advantages,
+                extra_correction,
+            ) = self._build_gopd_component_advantages(
+                data=data,
+                gopd_lambda=gopd_lambda,
+            )
+
+            if component == "opd":
+                component_advantages = opd_advantages
+            else:
+                component_advantages = extra_correction
+
+            # -------------------------------------------------
+            # Exactly the same GPG objective.
+            # -------------------------------------------------
+            component_loss, _, _, _ = policy_loss_fn(
+                old_log_prob,
+                log_prob,
+                component_advantages,
+                response_mask,
+                loss_agg_mode,
+                self.config,
+            )
+
+            # -------------------------------------------------
+            # IMPORTANT:
+            # Match the normal gradient-accumulation scaling.
+            # -------------------------------------------------
+            if self.config.use_dynamic_bsz:
+                component_loss = component_loss * (
+                    len(data)
+                    / self.config.ppo_mini_batch_size
+                )
+            else:
+                component_loss = (
+                    component_loss
+                    / self.gradient_accumulation
+                )
+
+            component_loss.backward()
+
+        # At this point:
+        #
+        #   p.grad = sum_m grad L_component^(m)
+        #
+        # over every micro-batch in this optimizer mini-batch.
+        grad_norm = self._get_grad_norm_without_step()
+
+        # Diagnostic gradients must not leak into real training.
+        self.actor_optimizer.zero_grad()
+
+        return grad_norm
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
@@ -393,6 +599,12 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
 
         if run_gopd_grad_diagnostics:
+            if "gopd_ref_log_prob" not in data.batch:
+                raise KeyError(
+                    "G-OPD gradient diagnostics require "
+                    "'gopd_ref_log_prob'."
+                )
+
             select_keys.append("gopd_ref_log_prob")
 
             if "teacher_log_prob" in data.batch:
@@ -409,7 +621,7 @@ class DataParallelPPOActor(BasePPOActor):
             
         if multi_turn:
             select_keys.append("loss_mask")
-        if self.config.use_kl_loss:
+        if self.config.use_kl_loss and "ref_log_prob" not in select_keys:
             select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -453,6 +665,78 @@ class DataParallelPPOActor(BasePPOActor):
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     # split batch into micro_batches
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                opd_grad_norm = None
+                extra_grad_norm = None
+
+                if run_gopd_grad_diagnostics:
+                    if self.config.policy_loss.get("loss_mode", "vanilla") != "gpg":
+                        raise ValueError(
+                            "G-OPD gradient diagnostics currently require "
+                            "policy_loss.loss_mode='gpg'."
+                        )
+
+                    # -----------------------------------------------------
+                    # Save RNG state before any diagnostic forward.
+                    #
+                    # The same RNG state will be restored before:
+                    #   1. OPD diagnostic pass
+                    #   2. extra diagnostic pass
+                    #   3. normal G-OPD training pass
+                    #
+                    # This prevents diagnostics from changing the stochastic
+                    # training trajectory.
+                    # -----------------------------------------------------
+                    cpu_rng_state = torch.get_rng_state()
+
+                    torch_device = get_torch_device()
+                    device_id = get_device_id()
+
+                    device_rng_state = torch_device.get_rng_state(
+                        device_id
+                    )
+
+                    def restore_rng_state():
+                        torch.set_rng_state(cpu_rng_state)
+                        torch_device.set_rng_state(
+                            device_rng_state,
+                            device=device_id,
+                        )
+
+                    # -----------------------------------------------------
+                    # OPD component gradient
+                    # -----------------------------------------------------
+                    restore_rng_state()
+
+                    opd_grad_norm = self._run_gopd_component_grad_pass(
+                        micro_batches=micro_batches,
+                        component="opd",
+                        temperature=temperature,
+                        loss_agg_mode=self.config.loss_agg_mode,
+                        gopd_lambda=gopd_lambda,
+                        multi_turn=multi_turn,
+                    )
+
+                    # -----------------------------------------------------
+                    # Extrapolation correction gradient
+                    # -----------------------------------------------------
+                    restore_rng_state()
+
+                    extra_grad_norm = self._run_gopd_component_grad_pass(
+                        micro_batches=micro_batches,
+                        component="extra",
+                        temperature=temperature,
+                        loss_agg_mode=self.config.loss_agg_mode,
+                        gopd_lambda=gopd_lambda,
+                        multi_turn=multi_turn,
+                    )
+
+                    # -----------------------------------------------------
+                    # Restore RNG once more before the real training pass.
+                    # Thus enabling diagnostics does not alter normal
+                    # training randomness.
+                    # -----------------------------------------------------
+                    restore_rng_state()
 
                 self.actor_optimizer.zero_grad()
 
@@ -528,69 +812,16 @@ class DataParallelPPOActor(BasePPOActor):
                                     "policy_loss.loss_mode='gpg'."
                                 )
 
-                            # -----------------------------------------------------
-                            # Teacher log-prob:
-                            #   privileged teacher -> teacher_log_prob
-                            #   standard teacher   -> ref_log_prob
-                            # -----------------------------------------------------
-                            if "teacher_log_prob" in data:
-                                teacher_log_prob = data["teacher_log_prob"]
-                            elif "ref_log_prob" in data:
-                                teacher_log_prob = data["ref_log_prob"]
-                            else:
-                                raise KeyError(
-                                    "G-OPD gradient diagnostics require either "
-                                    "'teacher_log_prob' or 'ref_log_prob'."
+                            opd_advantages, extra_correction = (
+                                self._build_gopd_component_advantages(
+                                    data=data,
+                                    gopd_lambda=gopd_lambda,
                                 )
-
-                            gopd_ref_log_prob = data["gopd_ref_log_prob"]
-
-                            # -----------------------------------------------------
-                            # A_OPD = log pi_T - log pi_old
-                            # -----------------------------------------------------
-                            opd_advantages = (
-                                teacher_log_prob
-                                - old_log_prob
-                            ).detach()
-
-                            # -----------------------------------------------------
-                            # C_extra
-                            #   = (lambda - 1)
-                            #     * (log pi_T - log pi_R)
-                            # -----------------------------------------------------
-                            extra_advantages = (
-                                (gopd_lambda - 1.0)
-                                * (
-                                    teacher_log_prob
-                                    - gopd_ref_log_prob
-                                )
-                            ).detach()
-
-                            # -----------------------------------------------------
-                            # Use exactly the same GPG loss implementation as the
-                            # actual G-OPD policy update.
-                            # -----------------------------------------------------
-                            opd_pg_loss, _, _, _ = policy_loss_fn(
-                                old_log_prob,
-                                log_prob,
-                                opd_advantages,
-                                response_mask,
-                                loss_agg_mode,
-                                self.config,
-                            )
-
-                            extra_pg_loss, _, _, _ = policy_loss_fn(
-                                old_log_prob,
-                                log_prob,
-                                extra_advantages,
-                                response_mask,
-                                loss_agg_mode,
-                                self.config,
                             )
 
                             reconstructed_advantages = (
                                 opd_advantages
-                                + extra_advantages
+                                + extra_correction
                             )
 
                             valid_mask = response_mask.bool()
@@ -608,7 +839,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                                 raise RuntimeError(
                                     "G-OPD gradient diagnostic decomposition "
-                                    f"does not match training advantages. "
+                                    "does not match training advantages. "
                                     f"max_diff={max_diff.item():.6e}"
                                 )
 

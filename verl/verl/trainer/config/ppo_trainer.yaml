@@ -887,7 +887,7 @@ algorithm:
   gopd:
     lam: 1.0
     grad_diagnostics:
-      enable: true
+      enable: False
       freq: 20
 
   # Whether to normalize advantages by std (specific to GRPO)
