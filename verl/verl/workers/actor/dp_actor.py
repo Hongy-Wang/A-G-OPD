@@ -578,6 +578,139 @@ class DataParallelPPOActor(BasePPOActor):
 
         return grad_norm
 
+    def _compute_gopd_gradient_geometry(
+            self,
+            opd_grad_norm,
+            extra_grad_norm,
+            total_grad_norm,
+            eps: float = 1e-12,
+        ):
+            """Compute G-OPD gradient geometry from component gradient norms."""
+
+            # Use double precision because polarization can involve
+            # subtraction of similarly sized squared norms.
+            n_opd = opd_grad_norm.detach().double()
+            n_extra = extra_grad_norm.detach().double()
+            n_total = total_grad_norm.detach().double()
+
+            finite = (
+                torch.isfinite(n_opd)
+                & torch.isfinite(n_extra)
+                & torch.isfinite(n_total)
+            )
+
+            opd_valid = n_opd > eps
+            extra_valid = n_extra > eps
+            total_valid = n_total > eps
+
+            geometry_valid = (
+                finite
+                & opd_valid
+                & extra_valid
+                & total_valid
+            )
+
+            # -----------------------------------------------------
+            # <g_opd, g_extra>
+            #
+            # ||g_opd + g_extra||^2
+            #   = ||g_opd||^2
+            #   + ||g_extra||^2
+            #   + 2 <g_opd, g_extra>
+            # -----------------------------------------------------
+            inner_product = (
+                n_total.square()
+                - n_opd.square()
+                - n_extra.square()
+            ) / 2.0
+
+            # -----------------------------------------------------
+            # Relative size of the extrapolation gradient.
+            # Defined whenever ||g_opd|| > 0.
+            # -----------------------------------------------------
+            if opd_valid:
+                extra_opd_norm_ratio = n_extra / n_opd
+                parallel_coef = inner_product / n_opd.square()
+
+                orthogonal_sq = (
+                    n_extra.square()
+                    - inner_product.square() / n_opd.square()
+                ).clamp_min(0.0)
+
+                orthogonal_ratio = (
+                    torch.sqrt(orthogonal_sq)
+                    / n_opd
+                )
+            else:
+                extra_opd_norm_ratio = torch.tensor(
+                    float("nan"),
+                    device=n_opd.device,
+                    dtype=n_opd.dtype,
+                )
+                parallel_coef = extra_opd_norm_ratio.clone()
+                orthogonal_ratio = extra_opd_norm_ratio.clone()
+
+            # -----------------------------------------------------
+            # cos(g_opd, g_extra)
+            #
+            # Undefined when either gradient norm is zero.
+            # -----------------------------------------------------
+            if opd_valid and extra_valid:
+                opd_extra_cosine = (
+                    inner_product / (n_opd * n_extra)
+                ).clamp(-1.0, 1.0)
+            else:
+                opd_extra_cosine = torch.tensor(
+                    float("nan"),
+                    device=n_opd.device,
+                    dtype=n_opd.dtype,
+                )
+
+            # -----------------------------------------------------
+            # cos(g_opd, g_total)
+            #
+            # <g_opd, g_total>
+            #   = ||g_opd||^2 + <g_opd, g_extra>
+            # -----------------------------------------------------
+            if opd_valid and total_valid:
+                opd_total_cosine = (
+                    (
+                        n_opd.square()
+                        + inner_product
+                    )
+                    / (n_opd * n_total)
+                ).clamp(-1.0, 1.0)
+            else:
+                opd_total_cosine = torch.tensor(
+                    float("nan"),
+                    device=n_opd.device,
+                    dtype=n_opd.dtype,
+                )
+
+            return {
+                "gopd/grad/opd_norm": n_opd.item(),
+                "gopd/grad/extra_norm": n_extra.item(),
+                "gopd/grad/total_norm": n_total.item(),
+
+                "gopd/grad/extra_opd_norm_ratio":
+                    extra_opd_norm_ratio.item(),
+
+                "gopd/grad/opd_extra_cosine":
+                    opd_extra_cosine.item(),
+
+                "gopd/grad/parallel_coef":
+                    parallel_coef.item(),
+
+                "gopd/grad/orthogonal_ratio":
+                    orthogonal_ratio.item(),
+
+                "gopd/grad/opd_total_cosine":
+                    opd_total_cosine.item(),
+
+                "gopd/grad/geometry_valid":
+                    float(geometry_valid.item()),
+            }
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
@@ -877,6 +1010,21 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()
+
+                if run_gopd_grad_diagnostics:
+                    grad_geometry = (
+                        self._compute_gopd_gradient_geometry(
+                            opd_grad_norm=opd_grad_norm,
+                            extra_grad_norm=extra_grad_norm,
+                            total_grad_norm=grad_norm,
+                        )
+                    )
+
+                    append_to_dict(
+                        metrics,
+                        grad_geometry,
+                    )
+
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
