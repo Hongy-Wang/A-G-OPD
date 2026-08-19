@@ -732,6 +732,17 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
 
         if run_gopd_grad_diagnostics:
+
+            if self.config.entropy_coeff != 0:
+                raise ValueError(
+                    "G-OPD gradient diagnostics require entropy_coeff=0."
+                )
+
+            if self.config.use_kl_loss:
+                raise ValueError(
+                    "G-OPD gradient diagnostics require use_kl_loss=False."
+                )
+
             if "gopd_ref_log_prob" not in data.batch:
                 raise KeyError(
                     "G-OPD gradient diagnostics require "
@@ -928,15 +939,6 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, self.config)
-
-                        # ---------------------------------------------------------
-                        # Build G-OPD component losses for gradient diagnostics.
-                        #
-                        # Only construct the losses here. Diagnostic backward
-                        # passes will be added separately.
-                        # ---------------------------------------------------------
-                        opd_pg_loss = None
-                        extra_pg_loss = None
 
                         if run_gopd_grad_diagnostics:
                             if loss_mode != "gpg":
