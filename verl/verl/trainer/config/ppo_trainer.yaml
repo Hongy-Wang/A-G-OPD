@@ -886,6 +886,9 @@ algorithm:
   # G-OPD lambda 
   gopd:
     lam: 1.0
+    grad_diagnostics:
+      enable: true
+      freq: 20
 
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True

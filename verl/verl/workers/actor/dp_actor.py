@@ -380,7 +380,33 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
+        run_gopd_grad_diagnostics = data.meta_info.get(
+            "gopd_grad_diagnostics",
+            False,
+        )
+
+        gopd_lambda = data.meta_info.get(
+            "gopd_lambda",
+            1.0,
+        )
+
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+
+        if run_gopd_grad_diagnostics:
+            select_keys.append("gopd_ref_log_prob")
+
+            if "teacher_log_prob" in data.batch:
+                select_keys.append("teacher_log_prob")
+
+            elif "ref_log_prob" in data.batch:
+                select_keys.append("ref_log_prob")
+
+            else:
+                raise KeyError(
+                    "G-OPD gradient diagnostics require either "
+                    "'teacher_log_prob' or 'ref_log_prob'."
+                )
+            
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -485,6 +511,106 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, self.config)
+
+                        # ---------------------------------------------------------
+                        # Build G-OPD component losses for gradient diagnostics.
+                        #
+                        # Only construct the losses here. Diagnostic backward
+                        # passes will be added separately.
+                        # ---------------------------------------------------------
+                        opd_pg_loss = None
+                        extra_pg_loss = None
+
+                        if run_gopd_grad_diagnostics:
+                            if loss_mode != "gpg":
+                                raise ValueError(
+                                    "G-OPD gradient diagnostics currently require "
+                                    "policy_loss.loss_mode='gpg'."
+                                )
+
+                            # -----------------------------------------------------
+                            # Teacher log-prob:
+                            #   privileged teacher -> teacher_log_prob
+                            #   standard teacher   -> ref_log_prob
+                            # -----------------------------------------------------
+                            if "teacher_log_prob" in data:
+                                teacher_log_prob = data["teacher_log_prob"]
+                            elif "ref_log_prob" in data:
+                                teacher_log_prob = data["ref_log_prob"]
+                            else:
+                                raise KeyError(
+                                    "G-OPD gradient diagnostics require either "
+                                    "'teacher_log_prob' or 'ref_log_prob'."
+                                )
+
+                            gopd_ref_log_prob = data["gopd_ref_log_prob"]
+
+                            # -----------------------------------------------------
+                            # A_OPD = log pi_T - log pi_old
+                            # -----------------------------------------------------
+                            opd_advantages = (
+                                teacher_log_prob
+                                - old_log_prob
+                            ).detach()
+
+                            # -----------------------------------------------------
+                            # C_extra
+                            #   = (lambda - 1)
+                            #     * (log pi_T - log pi_R)
+                            # -----------------------------------------------------
+                            extra_advantages = (
+                                (gopd_lambda - 1.0)
+                                * (
+                                    teacher_log_prob
+                                    - gopd_ref_log_prob
+                                )
+                            ).detach()
+
+                            # -----------------------------------------------------
+                            # Use exactly the same GPG loss implementation as the
+                            # actual G-OPD policy update.
+                            # -----------------------------------------------------
+                            opd_pg_loss, _, _, _ = policy_loss_fn(
+                                old_log_prob,
+                                log_prob,
+                                opd_advantages,
+                                response_mask,
+                                loss_agg_mode,
+                                self.config,
+                            )
+
+                            extra_pg_loss, _, _, _ = policy_loss_fn(
+                                old_log_prob,
+                                log_prob,
+                                extra_advantages,
+                                response_mask,
+                                loss_agg_mode,
+                                self.config,
+                            )
+
+                            reconstructed_advantages = (
+                                opd_advantages
+                                + extra_advantages
+                            )
+
+                            valid_mask = response_mask.bool()
+
+                            if not torch.allclose(
+                                reconstructed_advantages[valid_mask],
+                                advantages[valid_mask],
+                                atol=1e-5,
+                                rtol=1e-4,
+                            ):
+                                max_diff = (
+                                    reconstructed_advantages[valid_mask]
+                                    - advantages[valid_mask]
+                                ).abs().max()
+
+                                raise RuntimeError(
+                                    "G-OPD gradient diagnostic decomposition "
+                                    f"does not match training advantages. "
+                                    f"max_diff={max_diff.item():.6e}"
+                                )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

@@ -1850,6 +1850,38 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+
+                            # -----------------------------------------------------
+                            # G-OPD gradient diagnostics
+                            # -----------------------------------------------------
+                            if self.use_gopd:
+                                gopd_config = self.config.algorithm.get("gopd", {})
+
+                                grad_diag_config = gopd_config.get(
+                                    "grad_diagnostics",
+                                    {},
+                                )
+
+                                grad_diag_enable = grad_diag_config.get(
+                                    "enable",
+                                    False,
+                                )
+
+                                grad_diag_freq = grad_diag_config.get(
+                                    "freq",
+                                    20,
+                                )
+
+                                batch.meta_info["gopd_grad_diagnostics"] = (
+                                    grad_diag_enable
+                                    and self.global_steps % grad_diag_freq == 0
+                                )
+
+                                batch.meta_info["gopd_lambda"] = gopd_config.get(
+                                    "lam",
+                                    1.0,
+                                )
+
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
