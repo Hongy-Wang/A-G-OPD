@@ -883,9 +883,36 @@ algorithm:
   # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
   adv_estimator: gae
 
-  # G-OPD lambda 
+  # G-OPD configuration
   gopd:
+
+    # Fixed lambda used when adaptive lambda is disabled.
     lam: 1.0
+
+    # Adaptive lambda controller.
+    adaptive:
+
+      # Whether to dynamically adjust lambda during training.
+      enable: False
+
+      # Target effective extrapolation / OPD magnitude ratio:
+      #
+      #   ||(lambda - 1) A_extra||_2
+      #   ---------------------------- ~= target_ratio
+      #          ||A_opd||_2
+      #
+      target_ratio: 0.25
+
+      # Restrict adaptive lambda to positive extrapolation.
+      lambda_min: 1.0
+
+      # First pilot should never be more aggressive than
+      # the fixed lambda=1.25 baseline.
+      lambda_max: 1.25
+
+      # Numerical stability.
+      eps: 1.0e-8
+
     grad_diagnostics:
       enable: False
       freq: 20

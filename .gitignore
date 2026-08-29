@@ -36,3 +36,5 @@ nohup.out
 
 # Eval outputs
 eval_outputs/
+metrics/
+gopd_lambda_analysis/

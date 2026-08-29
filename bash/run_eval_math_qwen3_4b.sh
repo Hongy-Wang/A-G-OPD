@@ -33,8 +33,8 @@ export TOKENIZERS_PARALLELISM=false
 # -------------------------
 # 1. Model
 # -------------------------
-MODEL_PATH="${PROJECT_ROOT}/model/Qwen3-4B"
-MODEL_NAME="Qwen3-4B"
+MODEL_PATH="${PROJECT_ROOT}/model/qwen3_4b_to_4b_rl_math_gopd_lam1.25_step50_seed42"
+MODEL_NAME="qwen3_4b_to_4b_rl_math_gopd_lam1.25_step50_seed42"
 
 # -------------------------
 # 2. Evaluator
@@ -99,25 +99,25 @@ test -f "${AIME25_FILE}" || {
 # GPU 0
 # ============================================================
 
-# echo "[INFO] Starting AIME24 evaluation on GPU 0..."
+echo "[INFO] Starting AIME24 evaluation on GPU 0..."
 
-# CUDA_VISIBLE_DEVICES=1 python3 "${EVAL_PY}" \
-#     --input_file "${AIME24_FILE}" \
-#     --model_path "${MODEL_PATH}" \
-#     --output_file "${AIME24_OUTPUT}" \
-#     --max_tokens 16384 \
-#     --temperature 1.0 \
-#     --top_p 1.0 \
-#     --max_num_seqs 256 \
-#     --n 32 \
-#     --begin_idx -1 \
-#     --end_idx -1 \
-#     --seed 42 \
-#     > "${OUTPUT_ROOT}/aime24.log" 2>&1 &
+CUDA_VISIBLE_DEVICES=0 python3 "${EVAL_PY}" \
+    --input_file "${AIME24_FILE}" \
+    --model_path "${MODEL_PATH}" \
+    --output_file "${AIME24_OUTPUT}" \
+    --max_tokens 16384 \
+    --temperature 1.0 \
+    --top_p 1.0 \
+    --max_num_seqs 256 \
+    --n 32 \
+    --begin_idx -1 \
+    --end_idx -1 \
+    --seed 42 \
+    > "${OUTPUT_ROOT}/aime24.log" 2>&1 &
 
-# PID_AIME24=$!
+PID_AIME24=$!
 
-# echo "[INFO] AIME24 PID: ${PID_AIME24}"
+echo "[INFO] AIME24 PID: ${PID_AIME24}"
 
 
 # ============================================================
@@ -127,7 +127,7 @@ test -f "${AIME25_FILE}" || {
 
 echo "[INFO] Starting AIME25 evaluation on GPU 2..."
 
-CUDA_VISIBLE_DEVICES=1 python3 "${EVAL_PY}" \
+CUDA_VISIBLE_DEVICES=3 python3 "${EVAL_PY}" \
     --input_file "${AIME25_FILE}" \
     --model_path "${MODEL_PATH}" \
     --output_file "${AIME25_OUTPUT}" \
@@ -155,8 +155,8 @@ echo "[INFO] Both evaluations are running."
 echo "[INFO] Waiting for completion..."
 echo "============================================================"
 
-# wait "${PID_AIME24}"
-# STATUS_AIME24=$?
+wait "${PID_AIME24}"
+STATUS_AIME24=$?
 
 wait "${PID_AIME25}"
 STATUS_AIME25=$?
@@ -165,16 +165,16 @@ echo
 echo "============================================================"
 echo "Evaluation finished"
 echo "------------------------------------------------------------"
-# echo "AIME24 exit code : ${STATUS_AIME24}"
+echo "AIME24 exit code : ${STATUS_AIME24}"
 echo "AIME25 exit code : ${STATUS_AIME25}"
 echo
-# echo "AIME24 log:"
-# echo "  ${OUTPUT_ROOT}/aime24.log"
+echo "AIME24 log:"
+echo "  ${OUTPUT_ROOT}/aime24.log"
 echo
 echo "AIME25 log:"
 echo "  ${OUTPUT_ROOT}/aime25.log"
 echo
 echo "Outputs:"
-# echo "  ${AIME24_OUTPUT}"
+echo "  ${AIME24_OUTPUT}"
 echo "  ${AIME25_OUTPUT}"
 echo "============================================================"

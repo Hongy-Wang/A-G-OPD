@@ -65,8 +65,8 @@ export HYDRA_FULL_ERROR=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONHASHSEED=42
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-NUM_GPUS="${NUM_GPUS:-4}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,3}"
+NUM_GPUS="${NUM_GPUS:-2}"
 
 export SWANLAB_MODE="${SWANLAB_MODE:-cloud}"
 export SWANLAB_LOG_DIR="${SWANLAB_LOG_DIR:-${PROJECT_ROOT}/swanlog}"
@@ -106,10 +106,10 @@ VAL_FILES="['${AIME24_FILE}', '${AIME25_FILE}']"
 # ============================================================
 
 # Main ExOPD setting in the paper.
-GOPD_LAM="${GOPD_LAM:-1.25}"
+GOPD_LAM="${GOPD_LAM:-1}"
 
 # Same-size experiments in Section 4.1 use 50 optimizer steps.
-TRAINING_STEPS="${TRAINING_STEPS:-50}"
+TRAINING_STEPS="${TRAINING_STEPS:-20}"
 
 # All gradient diagnostics ON, at every training step.
 GOPD_GRAD_DIAG=true
@@ -136,11 +136,11 @@ ROLLOUT_TOP_P=1.0
 PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-32768}"
 
-ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-4}"
-ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}"
+ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-2}"
+ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.50}"
 
-TEST_FREQ="${TEST_FREQ:-10}"
-SAVE_FREQ="${SAVE_FREQ:-50}"
+TEST_FREQ="${TEST_FREQ:-2}"
+SAVE_FREQ="${SAVE_FREQ:-20}"
 
 
 # ============================================================
@@ -149,7 +149,7 @@ SAVE_FREQ="${SAVE_FREQ:-50}"
 
 PROJECT_NAME="${PROJECT_NAME:-gopd-mechanism-analysis}"
 
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3_4b_to_4b_rl_math_gopd_lam${GOPD_LAM}_diag_all_step50_seed42}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3_4b_to_4b_rl_math_gopd_lam${GOPD_LAM}_diag_all_step${TRAINING_STEPS}_seed42}"
 
 CKPT_DIR="${CKPT_DIR:-${PROJECT_ROOT}/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
 VAL_OUTPUT_DIR="${VAL_OUTPUT_DIR:-${PROJECT_ROOT}/validation_outputs_gopd/${EXPERIMENT_NAME}}"
@@ -296,7 +296,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=True \
     trainer.validation_data_dir="${VAL_OUTPUT_DIR}" \
     trainer.logger='["console","swanlab"]' \
-    trainer.log_val_generations=10 \
+    trainer.log_val_generations=2 \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     trainer.n_gpus_per_node="${NUM_GPUS}" \

@@ -1,6 +1,8 @@
 # Python environment used for this verl project.
 VENV_ROOT="/home/wanghongye/Code/LLM/verl-cu124/.venv"
 
+STEP=20
+ 
 # IMPORTANT:
 # Your training log showed that Python actually imported verl from:
 #   /home/wanghongye/Code/verl/verl
@@ -10,13 +12,13 @@ VENV_ROOT="/home/wanghongye/Code/LLM/verl-cu124/.venv"
 VERL_CODE_ROOT="/home/wanghongye/Code/verl"
 
 # Directory that contains your training checkpoints.
-CKPT_ROOT="/home/wanghongye/Code/LLM/verl-cu124/checkpoints/rsopd_math/qwen3_1.7b_to_4b_math1500_seed42"
+CKPT_ROOT="/home/wanghongye/Code/LLM/verl-cu124/checkpoints/gopd-mechanism-analysis/qwen3_4b_to_4b_rl_math_gopd_lam2_diag_all_step20_seed42"
 
 # Source verl actor checkpoint.
 LOCAL_DIR="${CKPT_ROOT}/global_step_${STEP}/actor"
 
 # Output directory containing the merged Hugging Face model.
-TARGET_DIR="${LOCAL_DIR}/merged_hf"
+TARGET_DIR="/home/wanghongye/Code/LLM/verl-cu124/model/qwen3_4b_to_4b_rl_math_gopd_lam2_step${STEP}_seed42"
 
 # Python executable.
 PYTHON="${VENV_ROOT}/bin/python"

@@ -294,7 +294,10 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         gopd_ref_log_prob = data.batch["gopd_ref_log_prob"]
 
         gopd_config = config.get("gopd", {})
-        lambda_val = gopd_config.get("lam", 1.0)
+        lambda_val = data.meta_info.get(
+            "gopd_lambda",
+            gopd_config.get("lam", 1.0),
+        )
 
 
         advantages = (
@@ -1740,6 +1743,94 @@ class RayPPOTrainer:
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
+                        if self.use_gopd:
+                            gopd_config = self.config.algorithm.get(
+                                "gopd",
+                                {},
+                            )
+
+                            adaptive_config = gopd_config.get(
+                                "adaptive",
+                                {},
+                            )
+
+                            adaptive_enable = adaptive_config.get(
+                                "enable",
+                                False,
+                            )
+
+                            # ---------------------------------------------------------
+                            # Get the three policy log-probs
+                            # ---------------------------------------------------------
+                            student_log_prob = batch.batch[
+                                "old_log_probs"
+                            ]
+
+                            if self.use_privileged_teacher:
+                                teacher_log_prob = batch.batch[
+                                    "teacher_log_prob"
+                                ]
+                            else:
+                                teacher_log_prob = batch.batch[
+                                    "ref_log_prob"
+                                ]
+
+                            gopd_ref_log_prob = batch.batch[
+                                "gopd_ref_log_prob"
+                            ]
+
+                            response_mask = batch.batch[
+                                "response_mask"
+                            ]
+
+                            # ---------------------------------------------------------
+                            # Runtime G-OPD lambda
+                            # ---------------------------------------------------------
+                            if adaptive_enable:
+                                runtime_lambda, adaptive_metrics = (
+                                    core_algos.compute_adaptive_gopd_lambda(
+                                        student_log_prob=student_log_prob,
+                                        teacher_log_prob=teacher_log_prob,
+                                        gopd_ref_log_prob=gopd_ref_log_prob,
+                                        response_mask=response_mask,
+                                        target_ratio=adaptive_config.get(
+                                            "target_ratio",
+                                            0.25,
+                                        ),
+                                        lambda_min=adaptive_config.get(
+                                            "lambda_min",
+                                            1.0,
+                                        ),
+                                        lambda_max=adaptive_config.get(
+                                            "lambda_max",
+                                            1.25,
+                                        ),
+                                        eps=adaptive_config.get(
+                                            "eps",
+                                            1e-8,
+                                        ),
+                                    )
+                                )
+
+                                metrics.update(adaptive_metrics)
+
+                            else:
+                                runtime_lambda = float(
+                                    gopd_config.get(
+                                        "lam",
+                                        1.0,
+                                    )
+                                )
+
+                                metrics[
+                                    "gopd/runtime_lambda"
+                                ] = runtime_lambda
+
+                            # Store the lambda actually used by this training batch.
+                            batch.meta_info[
+                                "gopd_lambda"
+                            ] = runtime_lambda
+
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1823,9 +1914,12 @@ class RayPPOTrainer:
                             {},
                         )
 
-                        lambda_val = gopd_config.get(
-                            "lam",
-                            1.0,
+                        lambda_val = batch.meta_info.get(
+                            "gopd_lambda",
+                            gopd_config.get(
+                                "lam",
+                                1.0,
+                            ),
                         )
 
                         metrics.update(
@@ -1875,11 +1969,6 @@ class RayPPOTrainer:
                                 batch.meta_info["gopd_grad_diagnostics"] = (
                                     grad_diag_enable
                                     and self.global_steps % grad_diag_freq == 0
-                                )
-
-                                batch.meta_info["gopd_lambda"] = gopd_config.get(
-                                    "lam",
-                                    1.0,
                                 )
 
                             actor_output = self.actor_rollout_wg.update_actor(batch)

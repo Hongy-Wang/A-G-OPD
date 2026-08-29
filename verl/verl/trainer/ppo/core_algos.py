@@ -1000,3 +1000,145 @@ def compute_policy_loss_gpg(
         torch.tensor(0.0),
         torch.tensor(0.0),
     )
+
+@torch.no_grad()
+def compute_adaptive_gopd_lambda(
+    student_log_prob: torch.Tensor,
+    teacher_log_prob: torch.Tensor,
+    gopd_ref_log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    target_ratio: float = 0.25,
+    lambda_min: float = 1.0,
+    lambda_max: float = 1.25,
+    eps: float = 1e-8,
+):
+    """
+    Compute a magnitude-balanced G-OPD lambda.
+
+    Definitions:
+        A_opd   = log pi_T - log pi_S
+        A_extra = log pi_T - log pi_R
+
+    We choose lambda such that approximately
+
+        ||(lambda - 1) A_extra||_2
+        -------------------------------- = target_ratio.
+              ||A_opd||_2
+
+    Therefore,
+
+        lambda
+        = 1 + target_ratio * ||A_opd||_2 / ||A_extra||_2.
+
+    Statistics are computed over valid response tokens only.
+    """
+
+    if target_ratio < 0:
+        raise ValueError(
+            f"target_ratio must be non-negative, got {target_ratio}"
+        )
+
+    if lambda_min < 1.0:
+        raise ValueError(
+            f"lambda_min must be >= 1.0 for magnitude-only A-G-OPD, "
+            f"got {lambda_min}"
+        )
+
+    if lambda_max < lambda_min:
+        raise ValueError(
+            f"lambda_max ({lambda_max}) must be >= "
+            f"lambda_min ({lambda_min})"
+        )
+
+    mask = response_mask.bool()
+
+    # ---------------------------------------------------------
+    # Raw G-OPD components
+    # ---------------------------------------------------------
+    opd_adv = (
+        teacher_log_prob
+        - student_log_prob
+    )
+
+    extra_adv = (
+        teacher_log_prob
+        - gopd_ref_log_prob
+    )
+
+    # Use only valid response tokens.
+    opd = opd_adv[mask].float()
+    extra = extra_adv[mask].float()
+
+    if opd.numel() == 0:
+        raise ValueError(
+            "No valid response tokens when computing adaptive G-OPD lambda."
+        )
+
+    # ---------------------------------------------------------
+    # RMS magnitude
+    #
+    # RMS rather than abs_mean so that this corresponds to
+    # an L2-style signal magnitude.
+    # ---------------------------------------------------------
+    opd_rms = torch.sqrt(
+        torch.mean(opd.square())
+    )
+
+    extra_rms = torch.sqrt(
+        torch.mean(extra.square())
+    )
+
+    # ---------------------------------------------------------
+    # Magnitude-balanced lambda
+    # ---------------------------------------------------------
+    lambda_unclipped = (
+        1.0
+        + target_ratio
+        * opd_rms
+        / (extra_rms + eps)
+    )
+
+    runtime_lambda = torch.clamp(
+        lambda_unclipped,
+        min=lambda_min,
+        max=lambda_max,
+    )
+
+    # ---------------------------------------------------------
+    # Diagnostics
+    # ---------------------------------------------------------
+    raw_extra_opd_ratio = (
+        extra_rms
+        / (opd_rms + eps)
+    )
+
+    effective_extra_opd_ratio = (
+        (runtime_lambda - 1.0)
+        * extra_rms
+        / (opd_rms + eps)
+    )
+
+    metrics = {
+        "gopd/adaptive/opd_rms":
+            opd_rms.item(),
+
+        "gopd/adaptive/extra_rms":
+            extra_rms.item(),
+
+        "gopd/adaptive/raw_extra_opd_rms_ratio":
+            raw_extra_opd_ratio.item(),
+
+        "gopd/adaptive/effective_extra_opd_rms_ratio":
+            effective_extra_opd_ratio.item(),
+
+        "gopd/adaptive/lambda_unclipped":
+            lambda_unclipped.item(),
+
+        "gopd/runtime_lambda":
+            runtime_lambda.item(),
+
+        "gopd/adaptive/target_ratio":
+            float(target_ratio),
+    }
+
+    return runtime_lambda.item(), metrics
