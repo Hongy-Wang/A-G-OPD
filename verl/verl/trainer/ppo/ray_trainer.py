@@ -1426,10 +1426,6 @@ class RayPPOTrainer:
             max_ckpt_to_keep=worker_max_actor_ckpt_to_keep,
         )
 
-        if save_best_checkpoint:
-            self._prune_actor_checkpoints(
-                max_actor_ckpt_to_keep
-            )
         # self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep)
 
         if self.use_critic:
@@ -1443,200 +1439,245 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
-        # latest checkpointed iteration tracker (for atomic usage)
-        local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
-        with open(local_latest_checkpointed_iteration, "w") as f:
-            f.write(str(self.global_steps))
+        if save_best_checkpoint:
+            kept_steps = self._prune_checkpoints(
+                max_actor_ckpt_to_keep
+            )
+        else:
+            kept_steps = None
 
-    def _prune_actor_checkpoints(
-            self,
-            max_ckpt_to_keep,
+        if (
+            save_best_checkpoint
+            and kept_steps is not None
+            and len(kept_steps) > 0
         ):
-            """
-            Keep at most `max_ckpt_to_keep` actor checkpoints.
-
-            Retention priority:
-                1. Best validation checkpoint.
-                2. Latest/current checkpoint.
-                3. Other checkpoints, from newest to oldest.
-
-            Examples
-            --------
-            max_ckpt_to_keep = 1:
-                keep best only, if a best checkpoint exists.
-
-            max_ckpt_to_keep = 2:
-                keep best + latest.
-
-            max_ckpt_to_keep = 3:
-                keep best + latest + one most recent checkpoint.
-
-            If the latest checkpoint is also the best checkpoint,
-            it occupies only one retention slot.
-            """
-
-            if max_ckpt_to_keep is None:
-                return
-
-            max_ckpt_to_keep = int(
-                max_ckpt_to_keep
+            latest_retained_step = max(
+                kept_steps
+            )
+        else:
+            latest_retained_step = (
+                self.global_steps
             )
 
-            if max_ckpt_to_keep <= 0:
-                return
+        local_latest_checkpointed_iteration = os.path.join(
+            self.config.trainer.default_local_dir,
+            "latest_checkpointed_iteration.txt",
+        )
 
-            ckpt_root = (
-                self.config.trainer.default_local_dir
+        with open(
+            local_latest_checkpointed_iteration,
+            "w",
+        ) as f:
+            f.write(
+                str(latest_retained_step)
             )
 
-            if not os.path.isdir(ckpt_root):
-                return
+        # # latest checkpointed iteration tracker (for atomic usage)
+        # local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
+        # with open(local_latest_checkpointed_iteration, "w") as f:
+        #     f.write(str(self.global_steps))
 
-            # ---------------------------------------------------------
-            # 1. Find all existing actor checkpoints.
-            #
-            # Expected layout:
-            #
-            #   default_local_dir/
-            #       global_step_5/
-            #           actor/
-            #       global_step_10/
-            #           actor/
-            #       ...
-            # ---------------------------------------------------------
-            checkpoint_steps = []
+    def _prune_checkpoints(
+        self,
+        max_ckpt_to_keep,
+    ):
+        """
+        Keep at most `max_ckpt_to_keep` checkpoint directories.
 
-            for name in os.listdir(ckpt_root):
-                if not name.startswith(
-                    "global_step_"
-                ):
-                    continue
+        Retention priority:
+            1. Best validation checkpoint.
+            2. Latest/current checkpoint.
+            3. Other checkpoints, from newest to oldest.
 
-                try:
-                    step = int(
-                        name.removeprefix(
-                            "global_step_"
-                        )
+        Notes
+        -----
+        - The whole `global_step_X/` directory is removed.
+        - If max_ckpt_to_keep == 1 and a best checkpoint exists,
+        only the best checkpoint is retained.
+        - If the current checkpoint is also the best checkpoint,
+        it occupies only one retention slot.
+
+        Returns
+        -------
+        list[int] | None
+            Sorted list of retained checkpoint steps.
+            Returns None when retention is disabled.
+        """
+
+        # ---------------------------------------------------------
+        # 0. Retention disabled
+        # ---------------------------------------------------------
+        if max_ckpt_to_keep is None:
+            return None
+
+        max_ckpt_to_keep = int(
+            max_ckpt_to_keep
+        )
+
+        if max_ckpt_to_keep <= 0:
+            return None
+
+        ckpt_root = (
+            self.config.trainer.default_local_dir
+        )
+
+        if not os.path.isdir(ckpt_root):
+            return []
+
+        # ---------------------------------------------------------
+        # 1. Find all existing global_step_X checkpoint dirs.
+        #
+        # Expected layout:
+        #
+        #   default_local_dir/
+        #       global_step_5/
+        #           actor/
+        #           data.pt
+        #
+        #       global_step_10/
+        #           actor/
+        #           data.pt
+        # ---------------------------------------------------------
+        checkpoint_steps = []
+
+        for name in os.listdir(ckpt_root):
+            if not name.startswith(
+                "global_step_"
+            ):
+                continue
+
+            try:
+                step = int(
+                    name.removeprefix(
+                        "global_step_"
                     )
-                except ValueError:
-                    continue
-
-                actor_path = os.path.join(
-                    ckpt_root,
-                    name,
-                    "actor",
                 )
+            except ValueError:
+                continue
 
-                if os.path.isdir(actor_path):
-                    checkpoint_steps.append(step)
+            step_path = os.path.join(
+                ckpt_root,
+                name,
+            )
 
-            checkpoint_steps.sort()
+            if os.path.isdir(step_path):
+                checkpoint_steps.append(step)
 
-            if (
-                len(checkpoint_steps)
-                <= max_ckpt_to_keep
-            ):
-                return
+        checkpoint_steps.sort()
 
-            # ---------------------------------------------------------
-            # 2. Build the keep list according to priority.
-            # ---------------------------------------------------------
-            keep_steps = []
+        # ---------------------------------------------------------
+        # 2. Nothing needs to be pruned.
+        # ---------------------------------------------------------
+        if (
+            len(checkpoint_steps)
+            <= max_ckpt_to_keep
+        ):
+            return sorted(
+                checkpoint_steps
+            )
 
-            # ---------------------------------------------------------
-            # Priority 1:
-            # Best validation checkpoint.
-            #
-            # If max_ckpt_to_keep == 1 and a best checkpoint exists,
-            # this will be the only retained checkpoint.
-            # ---------------------------------------------------------
-            if (
-                self.best_val_step is not None
-                and self.best_val_step
-                in checkpoint_steps
-            ):
-                keep_steps.append(
-                    self.best_val_step
-                )
+        # ---------------------------------------------------------
+        # 3. Build keep list according to retention priority.
+        # ---------------------------------------------------------
+        keep_steps = []
 
-            # ---------------------------------------------------------
-            # Priority 2:
-            # Latest/current checkpoint.
-            #
-            # Only keep it if there is still retention capacity.
-            # Therefore, when max_ckpt_to_keep == 1:
-            #
-            #   best exists -> keep best
-            #   no best     -> keep latest
-            # ---------------------------------------------------------
+        # ---------------------------------------------------------
+        # Priority 1:
+        # Best validation checkpoint.
+        # ---------------------------------------------------------
+        if (
+            self.best_val_step is not None
+            and self.best_val_step
+            in checkpoint_steps
+        ):
+            keep_steps.append(
+                self.best_val_step
+            )
+
+        # ---------------------------------------------------------
+        # Priority 2:
+        # Latest/current checkpoint.
+        #
+        # If max_ckpt_to_keep == 1 and a best checkpoint already
+        # occupies the only slot, current is not retained.
+        # ---------------------------------------------------------
+        if (
+            len(keep_steps)
+            < max_ckpt_to_keep
+            and self.global_steps
+            in checkpoint_steps
+            and self.global_steps
+            not in keep_steps
+        ):
+            keep_steps.append(
+                self.global_steps
+            )
+
+        # ---------------------------------------------------------
+        # Priority 3:
+        # Fill remaining slots with the most recent checkpoints.
+        # ---------------------------------------------------------
+        for step in sorted(
+            checkpoint_steps,
+            reverse=True,
+        ):
             if (
                 len(keep_steps)
-                < max_ckpt_to_keep
-                and self.global_steps
-                in checkpoint_steps
-                and self.global_steps
-                not in keep_steps
+                >= max_ckpt_to_keep
             ):
-                keep_steps.append(
-                    self.global_steps
-                )
+                break
 
-            # ---------------------------------------------------------
-            # Priority 3:
-            # Fill remaining slots with the most recent checkpoints.
-            # ---------------------------------------------------------
-            for step in sorted(
-                checkpoint_steps,
-                reverse=True,
-            ):
-                if (
-                    len(keep_steps)
-                    >= max_ckpt_to_keep
-                ):
-                    break
+            if step in keep_steps:
+                continue
 
-                if step in keep_steps:
-                    continue
+            keep_steps.append(step)
 
-                keep_steps.append(step)
+        keep_steps = set(
+            keep_steps
+        )
 
-            keep_steps = set(keep_steps)
+        # ---------------------------------------------------------
+        # 4. Remove all checkpoint directories that are not kept.
+        # ---------------------------------------------------------
+        remove_steps = [
+            step
+            for step in checkpoint_steps
+            if step not in keep_steps
+        ]
 
-            # ---------------------------------------------------------
-            # 3. Remove every actor checkpoint not selected above.
-            # ---------------------------------------------------------
-            remove_steps = [
-                step
-                for step in checkpoint_steps
-                if step not in keep_steps
-            ]
-
-            for step in remove_steps:
-                actor_path = os.path.join(
-                    ckpt_root,
-                    f"global_step_{step}",
-                    "actor",
-                )
-
-                print(
-                    "[Checkpoint retention] "
-                    f"Removing actor checkpoint "
-                    f"at step {step}: "
-                    f"{actor_path}"
-                )
-
-                shutil.rmtree(
-                    actor_path,
-                    ignore_errors=False,
-                )
+        for step in remove_steps:
+            step_path = os.path.join(
+                ckpt_root,
+                f"global_step_{step}",
+            )
 
             print(
                 "[Checkpoint retention] "
-                f"best_step={self.best_val_step}, "
-                f"latest_step={self.global_steps}, "
-                f"kept_steps="
-                f"{sorted(keep_steps)}"
+                f"Removing checkpoint "
+                f"at step {step}: "
+                f"{step_path}"
             )
+
+            shutil.rmtree(
+                step_path,
+                ignore_errors=False,
+            )
+
+        # ---------------------------------------------------------
+        # 5. Report and return retained checkpoints.
+        # ---------------------------------------------------------
+        kept_steps = sorted(
+            keep_steps
+        )
+
+        print(
+            "[Checkpoint retention] "
+            f"best_step={self.best_val_step}, "
+            f"latest_step={self.global_steps}, "
+            f"kept_steps={kept_steps}"
+        )
+
+        return kept_steps
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -1761,6 +1802,7 @@ class RayPPOTrainer:
 
                 metrics = {}
                 timing_raw = {}
+                best_checkpoint_improved = False
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
