@@ -1071,6 +1071,9 @@ trainer:
   # Maximum number of critic checkpoints to keep
   max_critic_ckpt_to_keep: null
 
+  # Whether to save the checkpoint with the best validation mean@N.
+  save_best_checkpoint: False
+
   # Timeout (in seconds) for Ray worker to wait for registration
   ray_wait_register_center_timeout: 300
 

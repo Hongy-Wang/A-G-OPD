@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
 from typing import Optional, Type
+import shutil
 
 import numpy as np
 import ray
@@ -1343,6 +1344,53 @@ class RayPPOTrainer:
                 worker_group=self.actor_rollout_wg,
             )
 
+    def _get_validation_mean_score(
+        self,
+        val_metrics: dict[str, float],
+    ) -> tuple[float, list[str]]:
+        """
+        Compute the checkpoint-selection score from validation mean@N.
+
+        For multiple validation data sources, average their mean@N
+        scores equally.
+
+        Example:
+            AIME2024 mean@8 = 0.60
+            AIME2025 mean@8 = 0.64
+
+            selection score = 0.62
+        """
+
+        val_n = int(
+            self.config.actor_rollout_ref.rollout.val_kwargs.n
+        )
+
+        suffix = f"/mean@{val_n}"
+
+        metric_keys = sorted(
+            key
+            for key in val_metrics
+            if key.startswith("val-core/")
+            and key.endswith(suffix)
+        )
+
+        if not metric_keys:
+            raise ValueError(
+                f"save_best_checkpoint=True but no validation "
+                f"mean@{val_n} metric was found. "
+                f"Available validation metrics: "
+                f"{sorted(val_metrics.keys())}"
+            )
+
+        values = [
+            float(val_metrics[key])
+            for key in metric_keys
+        ]
+
+        score = float(np.mean(values))
+
+        return score, metric_keys
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -1360,7 +1408,29 @@ class RayPPOTrainer:
         max_actor_ckpt_to_keep = self.config.trainer.get("max_actor_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         max_critic_ckpt_to_keep = self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
 
-        self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep)
+        save_best_checkpoint = self.config.trainer.get(
+            "save_best_checkpoint",
+            False,
+        )
+
+        worker_max_actor_ckpt_to_keep = (
+            None
+            if save_best_checkpoint
+            else max_actor_ckpt_to_keep
+        )
+
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path,
+            actor_remote_path,
+            self.global_steps,
+            max_ckpt_to_keep=worker_max_actor_ckpt_to_keep,
+        )
+
+        if save_best_checkpoint:
+            self._prune_actor_checkpoints(
+                max_actor_ckpt_to_keep
+            )
+        # self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep)
 
         if self.use_critic:
             critic_local_path = os.path.join(local_global_step_folder, "critic")
@@ -1377,6 +1447,196 @@ class RayPPOTrainer:
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+
+    def _prune_actor_checkpoints(
+            self,
+            max_ckpt_to_keep,
+        ):
+            """
+            Keep at most `max_ckpt_to_keep` actor checkpoints.
+
+            Retention priority:
+                1. Best validation checkpoint.
+                2. Latest/current checkpoint.
+                3. Other checkpoints, from newest to oldest.
+
+            Examples
+            --------
+            max_ckpt_to_keep = 1:
+                keep best only, if a best checkpoint exists.
+
+            max_ckpt_to_keep = 2:
+                keep best + latest.
+
+            max_ckpt_to_keep = 3:
+                keep best + latest + one most recent checkpoint.
+
+            If the latest checkpoint is also the best checkpoint,
+            it occupies only one retention slot.
+            """
+
+            if max_ckpt_to_keep is None:
+                return
+
+            max_ckpt_to_keep = int(
+                max_ckpt_to_keep
+            )
+
+            if max_ckpt_to_keep <= 0:
+                return
+
+            ckpt_root = (
+                self.config.trainer.default_local_dir
+            )
+
+            if not os.path.isdir(ckpt_root):
+                return
+
+            # ---------------------------------------------------------
+            # 1. Find all existing actor checkpoints.
+            #
+            # Expected layout:
+            #
+            #   default_local_dir/
+            #       global_step_5/
+            #           actor/
+            #       global_step_10/
+            #           actor/
+            #       ...
+            # ---------------------------------------------------------
+            checkpoint_steps = []
+
+            for name in os.listdir(ckpt_root):
+                if not name.startswith(
+                    "global_step_"
+                ):
+                    continue
+
+                try:
+                    step = int(
+                        name.removeprefix(
+                            "global_step_"
+                        )
+                    )
+                except ValueError:
+                    continue
+
+                actor_path = os.path.join(
+                    ckpt_root,
+                    name,
+                    "actor",
+                )
+
+                if os.path.isdir(actor_path):
+                    checkpoint_steps.append(step)
+
+            checkpoint_steps.sort()
+
+            if (
+                len(checkpoint_steps)
+                <= max_ckpt_to_keep
+            ):
+                return
+
+            # ---------------------------------------------------------
+            # 2. Build the keep list according to priority.
+            # ---------------------------------------------------------
+            keep_steps = []
+
+            # ---------------------------------------------------------
+            # Priority 1:
+            # Best validation checkpoint.
+            #
+            # If max_ckpt_to_keep == 1 and a best checkpoint exists,
+            # this will be the only retained checkpoint.
+            # ---------------------------------------------------------
+            if (
+                self.best_val_step is not None
+                and self.best_val_step
+                in checkpoint_steps
+            ):
+                keep_steps.append(
+                    self.best_val_step
+                )
+
+            # ---------------------------------------------------------
+            # Priority 2:
+            # Latest/current checkpoint.
+            #
+            # Only keep it if there is still retention capacity.
+            # Therefore, when max_ckpt_to_keep == 1:
+            #
+            #   best exists -> keep best
+            #   no best     -> keep latest
+            # ---------------------------------------------------------
+            if (
+                len(keep_steps)
+                < max_ckpt_to_keep
+                and self.global_steps
+                in checkpoint_steps
+                and self.global_steps
+                not in keep_steps
+            ):
+                keep_steps.append(
+                    self.global_steps
+                )
+
+            # ---------------------------------------------------------
+            # Priority 3:
+            # Fill remaining slots with the most recent checkpoints.
+            # ---------------------------------------------------------
+            for step in sorted(
+                checkpoint_steps,
+                reverse=True,
+            ):
+                if (
+                    len(keep_steps)
+                    >= max_ckpt_to_keep
+                ):
+                    break
+
+                if step in keep_steps:
+                    continue
+
+                keep_steps.append(step)
+
+            keep_steps = set(keep_steps)
+
+            # ---------------------------------------------------------
+            # 3. Remove every actor checkpoint not selected above.
+            # ---------------------------------------------------------
+            remove_steps = [
+                step
+                for step in checkpoint_steps
+                if step not in keep_steps
+            ]
+
+            for step in remove_steps:
+                actor_path = os.path.join(
+                    ckpt_root,
+                    f"global_step_{step}",
+                    "actor",
+                )
+
+                print(
+                    "[Checkpoint retention] "
+                    f"Removing actor checkpoint "
+                    f"at step {step}: "
+                    f"{actor_path}"
+                )
+
+                shutil.rmtree(
+                    actor_path,
+                    ignore_errors=False,
+                )
+
+            print(
+                "[Checkpoint retention] "
+                f"best_step={self.best_val_step}, "
+                f"latest_step={self.global_steps}, "
+                f"kept_steps="
+                f"{sorted(keep_steps)}"
+            )
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -1461,6 +1721,9 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+
+        self.best_val_score = -float("inf")
+        self.best_val_step = None
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1999,8 +2262,76 @@ class RayPPOTrainer:
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
 
-                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-                        with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        save_best_checkpoint = self.config.trainer.get(
+                            "save_best_checkpoint",
+                            False,
+                        )
+
+                        if save_best_checkpoint:
+                            current_val_score, selection_metric_keys = (
+                                self._get_validation_mean_score(
+                                    val_metrics
+                                )
+                            )
+
+                            metrics[
+                                "val-selection/mean_score"
+                            ] = current_val_score
+
+                            if current_val_score > self.best_val_score:
+                                self.best_val_score = current_val_score
+                                self.best_val_step = self.global_steps
+
+                                best_checkpoint_improved = True
+
+                                print(
+                                    f"[Best checkpoint] "
+                                    f"step={self.global_steps}, "
+                                    f"mean_score={current_val_score:.6f}, "
+                                    f"metrics={selection_metric_keys}"
+                                )
+
+                            metrics[
+                                "val-selection/best_mean_score"
+                            ] = self.best_val_score
+
+                    # if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
+                    #     with marked_timer("save_checkpoint", timing_raw, color="green"):
+                    #         self._save_checkpoint()
+                    save_best_checkpoint = self.config.trainer.get(
+                        "save_best_checkpoint",
+                        False,
+                    )
+
+                    save_freq = self.config.trainer.save_freq
+
+                    periodic_save = (
+                        save_freq > 0
+                        and self.global_steps % save_freq == 0
+                    )
+
+                    if save_best_checkpoint:
+                        should_save = (
+                            best_checkpoint_improved
+                            or periodic_save
+                            or is_last_step
+                        )
+                    else:
+                        # Preserve original VERL behavior.
+                        should_save = (
+                            save_freq > 0
+                            and (
+                                periodic_save
+                                or is_last_step
+                            )
+                        )
+
+                    if should_save:
+                        with marked_timer(
+                            "save_checkpoint",
+                            timing_raw,
+                            color="green",
+                        ):
                             self._save_checkpoint()
 
                 # training metrics
